@@ -8,6 +8,9 @@
     "start": "wrangler dev",
     "test": "vitest"
   },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0"
+  },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "vitest": "~4.1.0",
