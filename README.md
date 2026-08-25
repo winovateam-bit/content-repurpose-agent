@@ -4,8 +4,8 @@ A Cloudflare Worker that turns one piece of source content into platform-specifi
 variants — a LinkedIn post, an X thread, an Instagram caption, a TikTok/Reels
 script, and an email newsletter — using Claude.
 
-Give it raw text or a URL; it returns ready-to-post copy for whichever platforms
-you ask for.
+Give it raw text, a URL, or a YouTube video; it returns ready-to-post copy for
+whichever platforms you ask for.
 
 ## Setup
 
@@ -15,14 +15,17 @@ cp .dev.vars.example .dev.vars   # then fill in both values
 npm run dev                      # http://localhost:8787
 ```
 
-`.dev.vars` needs two secrets:
+`.dev.vars` needs these secrets:
 
-| Name                | What it is                                                                    |
-| ------------------- | ----------------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY` | Anthropic API key — https://console.anthropic.com/settings/keys                |
-| `RUN_TOKEN`         | Shared secret callers send as `x-run-token`. Any long random string will do.   |
+| Name                | Required | What it is                                                                  |
+| ------------------- | -------- | --------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY` | Yes      | Anthropic API key — https://console.anthropic.com/settings/keys              |
+| `RUN_TOKEN`         | Yes      | Shared secret callers send as `x-run-token`. Any long random string will do. |
+| `YOUTUBE_API_KEY`   | Only for `type: "youtube"` | YouTube Data API v3 key — https://console.cloud.google.com/apis/credentials |
 
-Generate a token with `node -e "console.log(crypto.randomUUID())"`.
+Generate a token with `node -e "console.log(crypto.randomUUID())"`. For the
+YouTube key, enable **YouTube Data API v3** on the Google Cloud project first,
+then create an API key credential — no OAuth consent screen needed.
 
 ## Deploying
 
@@ -32,6 +35,7 @@ first, or every request will fail closed with a 500:
 ```bash
 npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put RUN_TOKEN
+npx wrangler secret put YOUTUBE_API_KEY   # only if you use youtube sources
 npx wrangler deploy
 ```
 
@@ -59,7 +63,7 @@ before the body is read.
 | Field             | Required | Notes                                                                        |
 | ----------------- | -------- | ---------------------------------------------------------------------------- |
 | `source.type`     | yes      | `"text"`, `"url"`, or `"youtube"`                                            |
-| `source.content`  | yes      | Raw text for `text`; an http(s) URL for `url` and `youtube`                  |
+| `source.content`  | yes      | Raw text for `text`; an http(s) URL for `url`; a video link for `youtube`    |
 | `platforms`       | no       | Any of `linkedin`, `x`, `instagram`, `tiktok`, `email`. Defaults to all five. |
 | `tone`            | no       | `professional` (default), `casual`, `witty`, `educational`                   |
 | `target_audience` | no       | Free text, e.g. `"B2B SaaS founders"`                                        |
@@ -116,6 +120,7 @@ Every error is JSON: `{ "error": "..." }`.
 | Status | When                                                                        | Retry?                            |
 | ------ | --------------------------------------------------------------------------- | --------------------------------- |
 | `400`  | Malformed JSON, failed validation, content under 100 chars, URL fetch failed | No — fix the request              |
+| `400`  | Unrecognised YouTube URL; video not found or private; no captions available   | No — fix the request              |
 | `401`  | `x-run-token` missing or wrong                                              | No                                |
 | `404`  | Unknown path                                                                 | No                                |
 | `405`  | Non-POST request to `/repurpose`                                             | No                                |
@@ -123,7 +128,11 @@ Every error is JSON: `{ "error": "..." }`.
 | `422`  | Claude declined to process this source content                               | No — the content is the problem   |
 | `429`  | Upstream rate limit                                                          | Yes — after `Retry-After` seconds |
 | `500`  | Server misconfigured (missing secret) or a bug on our side                    | No — needs an operator            |
-| `502`  | Claude unreachable, errored, or returned unusable output                     | Yes                               |
+| `502`  | Claude or YouTube unreachable, errored, or returned unusable output           | Yes                               |
+
+YouTube quota exhaustion and an invalid `YOUTUBE_API_KEY` both surface as `502`
+(the Data API reports them identically as a 403); a missing `YOUTUBE_API_KEY` is
+a `500` with `"YOUTUBE_API_KEY is not configured"`.
 
 Upstream errors return a generic message — the underlying detail goes to
 `console.error` (visible via `wrangler tail`) and never reaches the caller.
@@ -140,8 +149,39 @@ back off and retry on your side.
   loopback, and link-local hosts are refused; redirects are followed at most 5
   hops with each hop re-validated; non-text content types (PDFs, images) are
   rejected; at most 2 MB is read.
-- **`youtube`** — not implemented yet. Returns a 400 asking for the transcript
-  as `type: "text"`.
+- **`youtube`** — the video's captions, fetched and flattened into a
+  transcript. Requires `YOUTUBE_API_KEY`. Accepted URL formats:
+
+  | Format                                        |
+  | --------------------------------------------- |
+  | `https://www.youtube.com/watch?v=VIDEO_ID`    |
+  | `https://youtu.be/VIDEO_ID`                   |
+  | `https://www.youtube.com/shorts/VIDEO_ID`     |
+  | `https://www.youtube.com/embed/VIDEO_ID`      |
+
+  A `www.` or `m.` prefix is optional, and extra query parameters (`?t=42`,
+  `?feature=share`) are ignored. Anything that isn't a single video — playlists,
+  channels, search results — is rejected with a 400.
+
+  ```json
+  { "source": { "type": "youtube", "content": "https://youtu.be/dQw4w9WgXcQ" } }
+  ```
+
+  Track selection prefers `en`, then `en-US`, then `en-GB`, then any other
+  English variant, then any language at all; within a language, human-written
+  captions are preferred over auto-generated (ASR) ones, which have no
+  punctuation and noticeably more errors. Sequence numbers, timestamps,
+  bracketed annotations (`[Music]`, `[Applause]`), and the duplicate lines that
+  rolling captions produce are all stripped.
+
+  **On the two-step download:** the YouTube Data API lists a video's caption
+  tracks with just an API key, but *downloading* the caption text requires OAuth
+  for videos you don't own. When that download comes back 401/403 — which is the
+  normal case for third-party videos — the Worker falls back to
+  `youtube.com/api/timedtext`, an undocumented but long-stable endpoint that
+  serves WebVTT without auth. Both formats are parsed the same way. Because the
+  fallback is undocumented, treat it as the part of this feature most likely to
+  need attention if YouTube changes something.
 
 ## Notes for operators
 
@@ -179,8 +219,10 @@ Claude API and outbound URL fetches are stubbed — no network calls, no spend.
 
 ## Layout
 
-| File               | Role                                                            |
-| ------------------ | --------------------------------------------------------------- |
-| `src/index.js`     | Routing, auth, request validation, response envelope            |
-| `src/extract.js`   | Source → plaintext (URL fetching, HTML stripping, size caps)    |
-| `src/repurpose.js` | Prompt construction, the Claude call, response validation       |
+| File               | Role                                                              |
+| ------------------ | ----------------------------------------------------------------- |
+| `src/index.js`     | Routing, auth, request validation, response envelope              |
+| `src/extract.js`   | Source → plaintext (URL fetching, HTML stripping, size caps)      |
+| `src/youtube.js`   | YouTube captions → transcript (track choice, SRT/VTT parsing)     |
+| `src/repurpose.js` | Prompt construction, the Claude call, response validation         |
+| `src/http.js`      | Shared plumbing: the `HttpError` type, fetch timeout, byte caps   |

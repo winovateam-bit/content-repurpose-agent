@@ -11,24 +11,14 @@
  * read. See extractFromUrl().
  */
 
+import { FETCH_TIMEOUT_MS, readCapped } from './http.js';
+import { extractYouTubeTranscript } from './youtube.js';
+
 /** Longest source text handed to Claude. Repurposing needs the core ideas, not the whole document. */
 export const MAX_CONTENT_CHARS = 20_000;
 
 /** Below this, there isn't enough substance to repurpose into five platforms. */
 export const MIN_CONTENT_CHARS = 100;
-
-/** Outbound fetches (URL extraction) time out after this long. */
-const FETCH_TIMEOUT_MS = 15_000;
-
-/**
- * Most bytes read from a fetched URL before the body is truncated.
- *
- * A Worker has a 128 MB memory ceiling shared with everything else in the
- * isolate, and `response.text()` on an unbounded body will happily blow through
- * it. 2 MB is far more HTML than any article needs — the text is cut to
- * MAX_CONTENT_CHARS immediately afterwards anyway.
- */
-const MAX_FETCH_BYTES = 2_000_000;
 
 /** Redirect hops followed before giving up. */
 const MAX_REDIRECTS = 5;
@@ -72,10 +62,11 @@ const BLOCKED_HOSTNAME_PATTERNS = [
  * Extract plaintext content from a `{ type, content }` source.
  *
  * @param {{ type: 'url' | 'text' | 'youtube', content: string }} source
+ * @param {Env} [env] bindings; required for `youtube` sources
  * @returns {Promise<string>} plaintext, capped at MAX_CONTENT_CHARS
- * @throws {Error} on unsupported/invalid source or fetch failure
+ * @throws {Error | HttpError} on unsupported/invalid source or fetch failure
  */
-export async function extractContent(source) {
+export async function extractContent(source, env = {}) {
 	if (source.type === 'text') {
 		return source.content.slice(0, MAX_CONTENT_CHARS);
 	}
@@ -85,7 +76,7 @@ export async function extractContent(source) {
 	}
 
 	if (source.type === 'youtube') {
-		throw new Error("YouTube support coming soon. Please paste the transcript as type='text' for now.");
+		return (await extractYouTubeTranscript(source.content, env)).slice(0, MAX_CONTENT_CHARS);
 	}
 
 	throw new Error(`Unsupported source type: "${source.type}". Use "url", "text", or "youtube".`);
@@ -181,39 +172,6 @@ async function fetchFollowingRedirects(rawUrl) {
 	}
 
 	throw new Error(`Could not fetch URL "${rawUrl}": more than ${MAX_REDIRECTS} redirects.`);
-}
-
-/**
- * Read a response body as text, stopping after MAX_FETCH_BYTES.
- *
- * @param {Response} response
- * @returns {Promise<string>}
- */
-async function readCapped(response) {
-	if (!response.body) return '';
-
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder('utf-8');
-	let text = '';
-	let bytesRead = 0;
-
-	try {
-		while (bytesRead < MAX_FETCH_BYTES) {
-			const { done, value } = await reader.read();
-			if (done) break;
-
-			const remaining = MAX_FETCH_BYTES - bytesRead;
-			// `stream: true` keeps a multi-byte character split across chunks intact.
-			text += decoder.decode(value.byteLength > remaining ? value.subarray(0, remaining) : value, { stream: true });
-			bytesRead += value.byteLength;
-		}
-		text += decoder.decode();
-	} finally {
-		// Releases the connection when we stopped early at the byte cap.
-		await reader.cancel().catch(() => {});
-	}
-
-	return text;
 }
 
 /**

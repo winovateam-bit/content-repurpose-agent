@@ -87,10 +87,25 @@ describe('extractContent', () => {
 		expect((await extractContent({ type: 'text', content: long })).length).toBe(MAX_CONTENT_CHARS);
 	});
 
-	it('rejects a youtube source with the coming-soon message', async () => {
-		await expect(extractContent({ type: 'youtube', content: 'https://youtu.be/abc' })).rejects.toThrow(
-			"YouTube support coming soon. Please paste the transcript as type='text' for now.",
-		);
+	it('delegates a youtube source and caps the transcript', async () => {
+		// Behaviour of the YouTube path itself is covered in youtube.spec.js; here
+		// we only check extractContent routes to it and applies the shared cap.
+		const line = 'This is a spoken sentence from the video. ';
+		globalThis.fetch = async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url.startsWith('https://www.googleapis.com/youtube/v3/captions?')) {
+				return Response.json({ items: [{ id: 'track-1', snippet: { language: 'en', trackKind: 'standard' } }] });
+			}
+			const cues = Array.from(
+				{ length: 1200 },
+				(_, index) => `${index + 1}\n00:00:0${index % 10},000 --> 00:00:0${index % 10},500\n${line}${index}\n`,
+			).join('\n');
+			return new Response(cues, { status: 200 });
+		};
+
+		const result = await extractContent({ type: 'youtube', content: 'https://youtu.be/dQw4w9WgXcQ' }, { YOUTUBE_API_KEY: 'k' });
+		expect(result.length).toBe(MAX_CONTENT_CHARS);
+		expect(result).toContain('This is a spoken sentence from the video.');
 	});
 
 	it('rejects an unsupported source type', async () => {

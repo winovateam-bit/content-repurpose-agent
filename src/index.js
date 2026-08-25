@@ -9,7 +9,8 @@
  */
 
 import { extractContent, MIN_CONTENT_CHARS } from './extract.js';
-import { repurposeContent, RepurposeError, ALL_PLATFORMS, DEFAULT_TONE } from './repurpose.js';
+import { HttpError } from './http.js';
+import { repurposeContent, ALL_PLATFORMS, DEFAULT_TONE } from './repurpose.js';
 
 const VALID_SOURCE_TYPES = ['url', 'text', 'youtube'];
 const VALID_TONES = ['professional', 'casual', 'witty', 'educational'];
@@ -49,6 +50,17 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
  */
 function jsonError(message, status, extraHeaders) {
 	return jsonResponse({ error: message }, status, extraHeaders);
+}
+
+/**
+ * Turn an HttpError into its response, honouring the status and Retry-After it
+ * carries. Only `clientMessage` is ever surfaced — `message` is for logs.
+ *
+ * @param {HttpError} error
+ * @returns {Response}
+ */
+function httpErrorResponse(error) {
+	return jsonError(error.clientMessage, error.status, error.retryAfter ? { 'Retry-After': String(error.retryAfter) } : undefined);
 }
 
 /**
@@ -169,8 +181,14 @@ async function handleRepurpose(request, env) {
 
 	let sourceText;
 	try {
-		sourceText = await extractContent(params.source);
+		sourceText = await extractContent(params.source, env);
 	} catch (error) {
+		// Most extraction failures are the caller's bad input (400), but a YouTube
+		// source can also hit a missing key (500) or an upstream fault (502).
+		if (error instanceof HttpError) {
+			console.error('[worker] extraction failed:', error?.stack ?? error);
+			return httpErrorResponse(error);
+		}
 		return jsonError(error.message, 400);
 	}
 
@@ -195,11 +213,9 @@ async function handleRepurpose(request, env) {
 	} catch (error) {
 		console.error('[worker] repurposeContent failed:', error?.stack ?? error);
 
-		// RepurposeError carries a status and a message vetted for the caller;
+		// HttpError carries a status and a message vetted for the caller;
 		// anything else is unexpected and gets the generic 500.
-		if (error instanceof RepurposeError) {
-			return jsonError(error.clientMessage, error.status, error.retryAfter ? { 'Retry-After': String(error.retryAfter) } : undefined);
-		}
+		if (error instanceof HttpError) return httpErrorResponse(error);
 		return jsonError('Failed to generate content. Please try again.', 500);
 	}
 

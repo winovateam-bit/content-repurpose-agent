@@ -8,6 +8,10 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { HttpError } from './http.js';
+
+/** What a caller sees for any failure that is not more specifically described. */
+const GENERIC_FAILURE = 'Failed to generate content. Please try again.';
 
 /** Quality matters more than cost for this endpoint. */
 const MODEL = 'claude-sonnet-5';
@@ -29,27 +33,6 @@ const DEFAULT_RETRY_AFTER_SECONDS = 30;
  * thinking lands well inside two.
  */
 const REQUEST_TIMEOUT_MS = 120_000;
-
-/**
- * A failure with a caller-facing status and message.
- *
- * `message` is what gets logged; `clientMessage` is the only part that reaches
- * the caller, so upstream detail (API keys, Anthropic's internal errors) can
- * never leak through it.
- */
-export class RepurposeError extends Error {
-	/**
-	 * @param {string} message internal message, for logs
-	 * @param {{ status?: number, clientMessage?: string, retryAfter?: number }} [options]
-	 */
-	constructor(message, { status = 500, clientMessage = 'Failed to generate content. Please try again.', retryAfter } = {}) {
-		super(message);
-		this.name = 'RepurposeError';
-		this.status = status;
-		this.clientMessage = clientMessage;
-		this.retryAfter = retryAfter;
-	}
-}
 
 export const ALL_PLATFORMS = ['linkedin', 'x', 'instagram', 'tiktok', 'email'];
 
@@ -91,8 +74,9 @@ const PLATFORM_INSTRUCTIONS = {
 export async function repurposeContent(env, { sourceText, platforms, tone, targetAudience }) {
 	if (!env.ANTHROPIC_API_KEY) {
 		// A missing secret is our deployment mistake, not the caller's request.
-		throw new RepurposeError('ANTHROPIC_API_KEY is not set — add it with: npx wrangler secret put ANTHROPIC_API_KEY', {
+		throw new HttpError('ANTHROPIC_API_KEY is not set — add it with: npx wrangler secret put ANTHROPIC_API_KEY', {
 			status: 500,
+			clientMessage: GENERIC_FAILURE,
 		});
 	}
 
@@ -125,18 +109,18 @@ export async function repurposeContent(env, { sourceText, platforms, tone, targe
 		// Typed SDK errors, mapped to what the caller should actually do about it.
 		if (error instanceof Anthropic.AuthenticationError) {
 			// Our key is bad — the caller can only wait for us to fix it.
-			throw new RepurposeError('Claude API rejected ANTHROPIC_API_KEY.', { status: 500 });
+			throw new HttpError('Claude API rejected ANTHROPIC_API_KEY.', { status: 500, clientMessage: GENERIC_FAILURE });
 		}
 		if (error instanceof Anthropic.RateLimitError) {
 			const retryAfter = retryAfterSeconds(error);
-			throw new RepurposeError('Claude API rate limited this request.', {
+			throw new HttpError('Claude API rate limited this request.', {
 				status: 429,
 				clientMessage: 'Upstream rate limit reached. Retry after the interval in the Retry-After header.',
 				retryAfter,
 			});
 		}
 		if (error instanceof Anthropic.APIConnectionError) {
-			throw new RepurposeError(`Could not reach the Claude API: ${error.message}`, {
+			throw new HttpError(`Could not reach the Claude API: ${error.message}`, {
 				status: 502,
 				clientMessage: 'Could not reach the content generation service. Please try again.',
 			});
@@ -145,11 +129,9 @@ export async function repurposeContent(env, { sourceText, platforms, tone, targe
 			// 5xx is upstream's problem and worth retrying; 4xx means we built a bad
 			// request, which retrying will not fix.
 			const upstreamFault = !error.status || error.status >= 500;
-			throw new RepurposeError(`Claude API error ${error.status}: ${error.message}`, {
+			throw new HttpError(`Claude API error ${error.status}: ${error.message}`, {
 				status: upstreamFault ? 502 : 500,
-				clientMessage: upstreamFault
-					? 'The content generation service returned an error. Please try again.'
-					: 'Failed to generate content. Please try again.',
+				clientMessage: upstreamFault ? 'The content generation service returned an error. Please try again.' : GENERIC_FAILURE,
 			});
 		}
 		throw error;
@@ -158,7 +140,7 @@ export async function repurposeContent(env, { sourceText, platforms, tone, targe
 	// A refusal is about the content itself, so retrying the same source will not
 	// help — say so rather than presenting it as a transient upstream fault.
 	if (response.stop_reason === 'refusal') {
-		throw new RepurposeError('Claude declined to repurpose this content.', {
+		throw new HttpError('Claude declined to repurpose this content.', {
 			status: 422,
 			clientMessage: 'The content generation service declined to process this source content.',
 		});
@@ -208,10 +190,10 @@ export async function repurposeContent(env, { sourceText, platforms, tone, targe
  * upstream fault rather than a bad request.
  *
  * @param {string} message internal message, for logs
- * @returns {RepurposeError}
+ * @returns {HttpError}
  */
 function upstreamOutputError(message) {
-	return new RepurposeError(message, {
+	return new HttpError(message, {
 		status: 502,
 		clientMessage: 'The content generation service returned an unusable response. Please try again.',
 	});

@@ -71,6 +71,10 @@ async function post(body, { auth = true, headers = {}, raw } = {}) {
 beforeEach(() => {
 	env.RUN_TOKEN = RUN_TOKEN;
 	env.ANTHROPIC_API_KEY = 'sk-ant-test';
+	// `env` is shared across tests in this isolate, and a stray YOUTUBE_API_KEY —
+	// set by an earlier test or present in a local .dev.vars — would make the
+	// "not configured" case order-dependent. Each test opts in explicitly.
+	delete env.YOUTUBE_API_KEY;
 	lastClaudeRequest = undefined;
 });
 
@@ -196,10 +200,10 @@ describe('validation', () => {
 		expect((await post({ source: { type: 'text', content: LONG_TEXT }, target_audience: 42 })).status).toBe(400);
 	});
 
-	it('400s a youtube source with the coming-soon message', async () => {
+	it('400s a youtube source whose URL is not a video link', async () => {
 		const response = await post({ source: { type: 'youtube', content: 'https://youtu.be/abc' } });
 		expect(response.status).toBe(400);
-		expect((await response.json()).error).toBe("YouTube support coming soon. Please paste the transcript as type='text' for now.");
+		expect((await response.json()).error).toMatch(/not a recognised YouTube video URL/i);
 	});
 
 	it('400s when the request body is not valid JSON', async () => {
@@ -347,6 +351,63 @@ describe('successful generation', () => {
 	it('400s when a url fetch fails', async () => {
 		globalThis.fetch = async () => new Response('nope', { status: 500 });
 		expect((await post({ source: { type: 'url', content: 'https://example.com/down' } })).status).toBe(400);
+	});
+
+	it('generates from a youtube transcript end to end', async () => {
+		env.YOUTUBE_API_KEY = 'test-yt-key';
+		const transcript = 'Most teams adopt AI the wrong way. They start with the tool, not the task. '.repeat(3);
+
+		globalThis.fetch = async (input, init) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url.startsWith('https://www.googleapis.com/youtube/v3/captions?')) {
+				return Response.json({ items: [{ id: 'track-1', snippet: { language: 'en', trackKind: 'standard' } }] });
+			}
+			if (url.startsWith('https://www.googleapis.com/youtube/v3/captions/')) {
+				return new Response(`1\n00:00:01,000 --> 00:00:20,000\n${transcript}\n`, { status: 200 });
+			}
+			if (url === 'https://api.anthropic.com/v1/messages') {
+				lastClaudeRequest = JSON.parse(init.body);
+				return Response.json(claudeResponse({ linkedin: 'Post from a video.' }));
+			}
+			throw new Error(`unexpected fetch to ${url}`);
+		};
+
+		const response = await post({
+			source: { type: 'youtube', content: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
+			platforms: ['linkedin'],
+		});
+
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.source_type).toBe('youtube');
+		expect(body.content).toEqual({ linkedin: 'Post from a video.' });
+		expect(lastClaudeRequest.messages[0].content).toContain('Most teams adopt AI the wrong way.');
+	});
+
+	it('500s when a youtube source is requested but YOUTUBE_API_KEY is unset', async () => {
+		delete env.YOUTUBE_API_KEY;
+		const response = await post({ source: { type: 'youtube', content: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' } });
+
+		expect(response.status).toBe(500);
+		expect((await response.json()).error).toBe('YOUTUBE_API_KEY is not configured');
+	});
+
+	it('502s when the YouTube API is out of quota', async () => {
+		env.YOUTUBE_API_KEY = 'test-yt-key';
+		globalThis.fetch = async () => new Response('quota', { status: 403 });
+
+		const response = await post({ source: { type: 'youtube', content: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' } });
+		expect(response.status).toBe(502);
+		expect((await response.json()).error).toMatch(/quota exceeded or API key invalid/);
+	});
+
+	it('400s when the video has no captions', async () => {
+		env.YOUTUBE_API_KEY = 'test-yt-key';
+		globalThis.fetch = async () => Response.json({ items: [] });
+
+		const response = await post({ source: { type: 'youtube', content: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' } });
+		expect(response.status).toBe(400);
+		expect((await response.json()).error).toBe('This video has no available captions');
 	});
 });
 
