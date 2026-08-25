@@ -1,0 +1,10 @@
+# Copy to `.dev.vars` and fill in real values. `.dev.vars` is gitignored.
+# These are the same two secrets the deployed Worker needs — set those with
+# `npx wrangler secret put <NAME>` rather than committing them anywhere.
+
+# Anthropic API key, from https://console.anthropic.com/settings/keys
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Shared secret callers must send as the `x-run-token` header.
+# Generate one with:  node -e "console.log(crypto.randomUUID())"
+RUN_TOKEN=replace-me

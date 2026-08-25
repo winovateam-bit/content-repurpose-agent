@@ -9,30 +9,46 @@
  */
 
 import { extractContent, MIN_CONTENT_CHARS } from './extract.js';
-import { repurposeContent, ALL_PLATFORMS, DEFAULT_TONE } from './repurpose.js';
+import { repurposeContent, RepurposeError, ALL_PLATFORMS, DEFAULT_TONE } from './repurpose.js';
 
 const VALID_SOURCE_TYPES = ['url', 'text', 'youtube'];
 const VALID_TONES = ['professional', 'casual', 'witty', 'educational'];
 
 /**
+ * Largest request body accepted.
+ *
+ * Source text is cut to 20k characters anyway, so a body beyond this is either
+ * a mistake or an attempt to make the isolate parse megabytes of JSON. Only
+ * enforceable when the client sends Content-Length — a chunked upload falls
+ * back to Cloudflare's own platform limit.
+ */
+const MAX_REQUEST_BYTES = 1_000_000;
+
+/**
  * @param {object} body
  * @param {number} [status]
+ * @param {Record<string, string>} [extraHeaders]
  * @returns {Response}
  */
-function jsonResponse(body, status = 200) {
+function jsonResponse(body, status = 200, extraHeaders = {}) {
 	return new Response(JSON.stringify(body, null, 2), {
 		status,
-		headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+		headers: {
+			'Content-Type': 'application/json; charset=utf-8',
+			'Cache-Control': 'no-store',
+			...extraHeaders,
+		},
 	});
 }
 
 /**
  * @param {string} message
  * @param {number} status
+ * @param {Record<string, string>} [extraHeaders]
  * @returns {Response}
  */
-function jsonError(message, status) {
-	return jsonResponse({ error: message }, status);
+function jsonError(message, status, extraHeaders) {
+	return jsonResponse({ error: message }, status, extraHeaders);
 }
 
 /**
@@ -98,7 +114,9 @@ function validateBody(body) {
 		if (invalid.length > 0) {
 			throw new Error(`Unsupported platform(s): ${invalid.join(', ')}. Valid platforms: ${ALL_PLATFORMS.join(', ')}.`);
 		}
-		resolvedPlatforms = platforms;
+		// De-duplicate: a repeated platform would otherwise appear twice in
+		// platforms_generated and repeat its instructions in the prompt.
+		resolvedPlatforms = [...new Set(platforms)];
 	}
 
 	let resolvedTone = DEFAULT_TONE;
@@ -130,6 +148,11 @@ async function handleRepurpose(request, env) {
 	const authError = await checkAuthorization(request, env);
 	if (authError) return authError;
 
+	const declaredLength = Number(request.headers.get('content-length'));
+	if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
+		return jsonError(`Request body is too large (limit ${MAX_REQUEST_BYTES} bytes).`, 413);
+	}
+
 	let rawBody;
 	try {
 		rawBody = await request.json();
@@ -151,9 +174,12 @@ async function handleRepurpose(request, env) {
 		return jsonError(error.message, 400);
 	}
 
-	if (sourceText.length < MIN_CONTENT_CHARS) {
+	// Measured on the trimmed text: 200 spaces around one word is not 200
+	// characters of content to repurpose.
+	const meaningfulLength = sourceText.trim().length;
+	if (meaningfulLength < MIN_CONTENT_CHARS) {
 		return jsonError(
-			`Extracted content is too short (${sourceText.length} characters, minimum ${MIN_CONTENT_CHARS}). Provide more substantial source content.`,
+			`Extracted content is too short (${meaningfulLength} characters, minimum ${MIN_CONTENT_CHARS}). Provide more substantial source content.`,
 			400,
 		);
 	}
@@ -168,6 +194,12 @@ async function handleRepurpose(request, env) {
 		});
 	} catch (error) {
 		console.error('[worker] repurposeContent failed:', error?.stack ?? error);
+
+		// RepurposeError carries a status and a message vetted for the caller;
+		// anything else is unexpected and gets the generic 500.
+		if (error instanceof RepurposeError) {
+			return jsonError(error.clientMessage, error.status, error.retryAfter ? { 'Retry-After': String(error.retryAfter) } : undefined);
+		}
 		return jsonError('Failed to generate content. Please try again.', 500);
 	}
 
@@ -188,7 +220,24 @@ async function handleRepurpose(request, env) {
 async function route(request, env) {
 	const url = new URL(request.url);
 
-	if (url.pathname === '/repurpose' && request.method === 'POST') {
+	// Unauthenticated health check for uptime monitoring. Deliberately reports
+	// nothing about configuration: a monitor only needs 200 vs not-200, and
+	// telling anonymous callers whether secrets are set would be a free hint.
+	if (url.pathname === '/' && (request.method === 'GET' || request.method === 'HEAD')) {
+		return jsonResponse({ status: 'ok', service: 'content-repurpose-agent', endpoint: 'POST /repurpose' });
+	}
+
+	if (url.pathname === '/repurpose') {
+		if (request.method !== 'POST') {
+			return new Response(JSON.stringify({ error: 'Method Not Allowed. Use POST.' }, null, 2), {
+				status: 405,
+				headers: {
+					'Content-Type': 'application/json; charset=utf-8',
+					'Cache-Control': 'no-store',
+					Allow: 'POST',
+				},
+			});
+		}
 		return await handleRepurpose(request, env);
 	}
 
