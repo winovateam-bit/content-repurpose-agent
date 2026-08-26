@@ -258,6 +258,21 @@ describe('timedtext fallback', () => {
 		expect(calls.some((url) => url.startsWith('https://www.youtube.com/api/timedtext'))).toBe(true);
 	});
 
+	it('502s when the fallback answers 200 with a zero-length body', async () => {
+		// YouTube serves an empty text/html 200 when it will not release a track.
+		// That is a failed download, not a track that parsed to nothing.
+		stubYouTube({
+			list: englishTrack(),
+			srt: () => new Response('needs oauth', { status: 401 }),
+			vtt: () => new Response('', { status: 200, headers: { 'content-type': 'text/html; charset=UTF-8' } }),
+		});
+
+		await expect(extractYouTubeTranscript(VIDEO_URL, ENV)).rejects.toMatchObject({
+			status: 502,
+			clientMessage: 'Could not download captions for this video. Please try again.',
+		});
+	});
+
 	it('does not fall back on a genuine download failure', async () => {
 		const calls = stubYouTube({ list: englishTrack(), srt: () => new Response('boom', { status: 500 }) });
 

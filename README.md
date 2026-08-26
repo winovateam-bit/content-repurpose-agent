@@ -7,6 +7,11 @@ script, and an email newsletter — using Claude.
 Give it raw text, a URL, or a YouTube video; it returns ready-to-post copy for
 whichever platforms you ask for.
 
+> **YouTube transcript support is currently paused.** A YouTube platform change
+> removed unauthenticated access to caption text, so `type: "youtube"` requests
+> now fail rather than returning a transcript. The `text` and `url` source types
+> are unaffected and fully functional. See [Source types](#source-types).
+
 ## Setup
 
 ```bash
@@ -178,10 +183,22 @@ back off and retry on your side.
   tracks with just an API key, but *downloading* the caption text requires OAuth
   for videos you don't own. When that download comes back 401/403 — which is the
   normal case for third-party videos — the Worker falls back to
-  `youtube.com/api/timedtext`, an undocumented but long-stable endpoint that
-  serves WebVTT without auth. Both formats are parsed the same way. Because the
-  fallback is undocumented, treat it as the part of this feature most likely to
-  need attention if YouTube changes something.
+  `youtube.com/api/timedtext`, which served WebVTT without auth for years. Both
+  formats are parsed the same way.
+
+  **Why it is paused:** that fallback no longer works. `timedtext` now answers
+  every unauthenticated request with `HTTP 200`, `Content-Type: text/html`, and a
+  zero-length body — for every video, in every format (`vtt`, `srt`, `json3`), and
+  even when called with the signed `baseUrl` lifted from the watch page. YouTube
+  gated the endpoint behind a proof-of-origin token. Since the Data API path only
+  covers videos the key's owner controls, there is no unauthenticated route to
+  caption text left, and `type: "youtube"` returns a `502` (`Could not download
+  captions for this video`).
+
+  Track listing, URL parsing, track selection, and SRT/VTT parsing are all still
+  correct and still tested — only the download step is blocked. Restoring the
+  feature means picking a new source for caption text: a third-party transcript
+  API, a proof-of-origin token provider, or OAuth for owned videos only.
 
 ## Notes for operators
 

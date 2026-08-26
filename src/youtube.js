@@ -269,7 +269,20 @@ async function downloadTimedText(videoId, language) {
 		});
 	}
 
-	return await readCapped(response);
+	const body = await readCapped(response);
+
+	// timedtext answers 200 with a zero-length body when it will not serve the
+	// track. That is a download failure, not a track that parsed to nothing, and
+	// saying so keeps the log honest about which half actually broke.
+	if (!body.trim()) {
+		throw new HttpError(
+			`Timedtext fallback for ${videoId} returned HTTP 200 with an empty body ` +
+				`(content-type ${response.headers.get('content-type') ?? 'none'}).`,
+			{ status: 502, clientMessage: DOWNLOAD_FAILED_MESSAGE },
+		);
+	}
+
+	return body;
 }
 
 /**
